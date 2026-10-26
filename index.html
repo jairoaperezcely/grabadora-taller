@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<title>Grabadora del taller</title>
+<style>
+:root{--navy:#10244D;--azul:#577F9F;--rojo:#E73339;--ok:#2E7D4F;--alerta:#B26A00;--fondo:#F5F7FA;--borde:#D9DFE7;--suave:#5B6676;--texto:#1B2433}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--fondo);color:var(--texto);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-size:16px;line-height:1.4}
+main{max-width:520px;margin:0 auto;padding:20px 16px 48px}
+h1{font-size:19px;margin:0 0 2px;color:var(--navy)}
+.sub{color:var(--suave);font-size:14px;margin:0 0 16px}
+.tarjeta{background:#fff;border:1px solid var(--borde);border-radius:12px;padding:16px;margin-bottom:14px}
+label{display:block;font-size:13px;color:var(--suave);margin-bottom:4px}
+select{width:100%;min-height:44px;border:1px solid var(--borde);border-radius:10px;padding:8px 10px;font:inherit;background:#fff}
+.btn{display:flex;align-items:center;justify-content:center;width:100%;min-height:56px;border-radius:12px;border:0;font:inherit;font-weight:700;font-size:18px;color:#fff;background:var(--navy);cursor:pointer;margin-top:14px}
+.btn.rojo{background:var(--rojo)}
+.btn[disabled]{opacity:.5;cursor:not-allowed}
+.reloj{font-size:34px;font-weight:700;text-align:center;font-variant-numeric:tabular-nums;margin-top:12px;color:var(--navy)}
+.reloj small{display:block;font-size:13px;font-weight:400;color:var(--suave)}
+.rec{color:var(--rojo)}
+.mini{font-size:13px;color:var(--suave);margin-top:8px}
+.alerta{background:#FFF4E5;border:1px solid #F0C27A;color:#6B4200;border-radius:10px;padding:10px 12px;font-size:14px;margin-bottom:14px}
+.error{background:#FDECEC;border-color:#F3A9AB;color:#8A1F23}
+ul{list-style:none;margin:0;padding:0}
+li{display:flex;justify-content:space-between;gap:8px;padding:8px 0;border-top:1px solid var(--borde);font-size:14px}
+li:first-child{border-top:0}
+.est{white-space:nowrap;color:var(--suave)}
+.est.ok{color:var(--ok)}.est.mal{color:var(--rojo)}
+.oculto{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <h1 id="titulo">Grabadora del taller</h1>
+  <p class="sub" id="subtitulo">Cargando…</p>
+  <div id="aviso" class="alerta oculto"></div>
+
+  <div class="tarjeta" id="panel">
+    <label for="franja">Franja que se está grabando</label>
+    <select id="franja"></select>
+    <div class="reloj" id="reloj">0:00<small id="relojSub">Cada pista dura 15 minutos y se sube sola</small></div>
+    <button class="btn" id="boton" type="button" disabled>● Grabar</button>
+    <div class="mini">Deje esta pestaña abierta y la pantalla encendida, con el celular conectado al cargador. Si cambia de franja, la pista se corta y la siguiente sale con la franja nueva. Nada entra al acta sin que la relatora lo acepte en la aplicación.</div>
+  </div>
+
+  <div class="tarjeta">
+    <strong>Pistas</strong>
+    <ul id="pistas"><li><span>Todavía no hay pistas.</span></li></ul>
+  </div>
+</main>
+
+<script>
+/* Grabadora externa del taller (v1.9).
+ * Apps Script bloquea el micrófono dentro de su aplicación web; esta página graba
+ * por fuera y sube cada pista a la aplicación por su doPost, con un token que solo
+ * sirve para subir y leer audio. No guarda nada en servidores propios: las pistas
+ * esperan en este equipo (IndexedDB) solo hasta que se suben. */
+var MIN = 15, TROZO = 2 * 1024 * 1024, KBPS = 32000;
+var S = { exec:'', token:'', info:null, stream:null, rec:null, pista:null, activa:false, wake:null, cola:[], subiendo:false, lista:[] };
+var $ = function(id){ return document.getElementById(id); };
+
+/* ---------- Parámetros: llegan en el # y se borran de la barra de direcciones ---------- */
+function leerParametros(){
+  var h = {}, crudo = location.hash.replace(/^#/, '');
+  crudo.split('&').forEach(function(p){ var i = p.indexOf('='); if (i > 0) h[p.slice(0,i)] = decodeURIComponent(p.slice(i+1)); });
+  if (h.e && h.t) {
+    S.exec = h.e; S.token = h.t; S.franjaInicial = h.f || '';
+    try { sessionStorage.setItem('grab', JSON.stringify({ e:h.e, t:h.t, f:h.f || '' })); } catch(e){}
+    try { history.replaceState(null, '', location.pathname); } catch(e){}
+  } else {
+    try { var g = JSON.parse(sessionStorage.getItem('grab') || 'null'); if (g) { S.exec = g.e; S.token = g.t; S.franjaInicial = g.f; } } catch(e){}
+  }
+  if (!/^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(S.exec)) { S.exec = ''; S.token = ''; }
+}
+
+/* ---------- Llamadas a la aplicación (POST simple, sin preflight) ---------- */
+function llamar(a, args){
+  return fetch(S.exec, { method:'POST', body: JSON.stringify({ a:a, args:args }), redirect:'follow' })
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if (!j.ok) { if (/SESION_VENCIDA/.test(j.error)) vencido(); throw new Error(j.error); }
+      return j.r;
+    });
+}
+function vencido(){
+  aviso('El enlace de la grabadora venció. Vuelva a abrirla desde la aplicación; las pistas pendientes siguen guardadas en este equipo.', true);
+  S.vencido = true;
+}
+function aviso(t, error){ var a = $('aviso'); a.textContent = t; a.className = 'alerta' + (error ? ' error' : ''); }
+function quitarAviso(){ $('aviso').className = 'alerta oculto'; }
+
+/* ---------- Cola guardada en el equipo (sobrevive a una recarga) ---------- */
+var DB = null;
+function db(){
+  return new Promise(function(res){
+    if (DB) return res(DB);
+    try {
+      var rq = indexedDB.open('grabadora_taller', 1);
+      rq.onupgradeneeded = function(){ rq.result.createObjectStore('cola', { keyPath:'k' }); };
+      rq.onsuccess = function(){ DB = rq.result; res(DB); };
+      rq.onerror = function(){ res(null); };
+    } catch(e){ res(null); }
+  });
+}
+function dbHacer(modo, fn){
+  return db().then(function(d){ return new Promise(function(res){
+    if (!d) return res(null);
+    try { var tx = d.transaction('cola', modo), r = fn(tx.objectStore('cola')); tx.oncomplete = function(){ res(r && r.result !== undefined ? r.result : true); }; tx.onerror = function(){ res(null); }; }
+    catch(e){ res(null); }
+  }); });
+}
+
+/* ---------- Grabación ---------- */
+function soportado(){ return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder); }
+function mime(){
+  var ops = ['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg;codecs=opus'];
+  for (var i = 0; i < ops.length; i++) { try { if (MediaRecorder.isTypeSupported(ops[i])) return ops[i]; } catch(e){} }
+  return '';
+}
+function nombreFranja(id){ var f = (S.info && S.info.franjas || []).filter(function(x){ return x.id === id; })[0]; return f ? f.nombre : id; }
+
+function iniciar(){
+  if (S.activa) return;
+  if (!soportado()) { aviso('Este navegador no permite grabar. Use Chrome, Edge o Safari actualizados.', true); return; }
+  var arrancar = function(stream){
+    S.stream = stream;
+    var m = mime(), opc = { audioBitsPerSecond: KBPS }; if (m) opc.mimeType = m;
+    var rec; try { rec = new MediaRecorder(stream, opc); } catch(e) { rec = new MediaRecorder(stream); }
+    var pista = { trozos:[], inicio:Date.now(), franja:$('franja').value, mime: rec.mimeType || m };
+    S.rec = rec; S.pista = pista; S.activa = true;
+    rec.ondataavailable = function(ev){ if (ev.data && ev.data.size) pista.trozos.push(ev.data); };
+    rec.onstop = function(){
+      cerrarPista(pista);
+      if (S.rec === rec && S.activa) { S.activa = false; aviso('La grabación se detuvo (el equipo soltó el micrófono). Pulse Grabar de nuevo.', true); pintar(); }
+    };
+    rec.start(10000);
+    pedirPantalla();
+    quitarAviso(); pintar();
+  };
+  if (S.stream && S.stream.active) return arrancar(S.stream);
+  navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:true, noiseSuppression:true } }).then(arrancar).catch(function(e){
+    aviso('No se pudo usar el micrófono (' + ((e && e.name) || 'error') + '). Permita el micrófono para esta página en el navegador y vuelva a intentar.', true);
+  });
+}
+function detener(soltar){
+  if (!S.activa || !S.rec) return;
+  S.activa = false;
+  try { S.rec.stop(); } catch(e){}
+  if (soltar !== false) {
+    try { S.stream.getTracks().forEach(function(t){ t.stop(); }); } catch(e){}
+    S.stream = null;
+    try { if (S.wake) S.wake.release(); } catch(e){} S.wake = null;
+  }
+  pintar();
+}
+function cortar(){ detener(false); iniciar(); }
+function pedirPantalla(){ try { if (navigator.wakeLock && !S.wake) navigator.wakeLock.request('screen').then(function(w){ S.wake = w; w.addEventListener && w.addEventListener('release', function(){ S.wake = null; }); }).catch(function(){}); } catch(e){} }
+
+function cerrarPista(p){
+  if (!p || p.cerrada || !p.trozos.length) return;
+  p.cerrada = true;
+  var tipo = (p.mime || 'audio/webm').split(';')[0];
+  var ext = /mp4/.test(tipo) ? 'm4a' : /ogg/.test(tipo) ? 'ogg' : 'webm';
+  var d = new Date(p.inicio), hhmm = ('0'+d.getHours()).slice(-2) + ('0'+d.getMinutes()).slice(-2);
+  var item = { k:'p_' + Date.now() + '_' + Math.random().toString(36).slice(2,7), blob: new Blob(p.trozos, { type: tipo }),
+    nombre: 'Grabacion ' + p.franja + ' ' + hhmm + ' pista ' + (S.n = (S.n || 0) + 1) + '.' + ext, tipo: tipo, franja: p.franja, exec: S.exec, token: S.token, estado:'en cola' };
+  S.cola.push(item); S.lista.unshift(item);
+  dbHacer('readwrite', function(st){ return st.put({ k:item.k, blob:item.blob, nombre:item.nombre, tipo:item.tipo, franja:item.franja, exec:item.exec, token:item.token }); })
+    .then(function(){ subir(); });
+  pintar();
+}
+
+/* ---------- Subida por partes y lectura con Gemini ---------- */
+function base64(blob){
+  return new Promise(function(res, rej){ var r = new FileReader(); r.onload = function(){ res(String(r.result).split(',')[1] || ''); }; r.onerror = rej; r.readAsDataURL(blob); });
+}
+function subir(){
+  if (S.subiendo || !S.cola.length || !navigator.onLine || S.vencido) return;
+  S.subiendo = true;
+  var p = S.cola[0], tok = p.token || S.token;
+  if (p.exec) S.exec = p.exec;
+  p.estado = 'subiendo 0 %'; pintar();
+  llamar('iniciarSubida', [tok, { nombre:p.nombre, mime:p.tipo, bytes:p.blob.size, seccion:'nota', mesa:0, nota:'Franja ' + p.franja + ' · grabación con cortes automáticos' }])
+  .then(function(r){
+    var inicio = 0;
+    var siguiente = function(){
+      return base64(p.blob.slice(inicio, Math.min(inicio + TROZO, p.blob.size)))
+        .then(function(b64){ return llamar('subirParte', [tok, r.subidaId, b64, inicio]); })
+        .then(function(res){
+          inicio = res.listo ? p.blob.size : (res.siguiente || Math.min(inicio + TROZO, p.blob.size));
+          p.estado = 'subiendo ' + Math.round(100 * inicio / p.blob.size) + ' %'; pintar();
+          return res.listo ? res : siguiente();
+        });
+    };
+    return siguiente();
+  })
+  .then(function(res){
+    S.cola.shift(); dbHacer('readwrite', function(st){ return st.delete(p.k); });
+    p.estado = 'leyendo…'; pintar();
+    llamar('procesarAdjunto', [tok, res.adjuntoId])
+      .then(function(x){ p.estado = 'lista · ' + x.sugerencias + ' sugerencias'; p.ok = true; pintar(); })
+      .catch(function(){ p.estado = 'subida · leer en la app'; p.ok = true; pintar(); });
+  })
+  .catch(function(e){ p.estado = 'en cola (' + (navigator.onLine ? 'reintenta' : 'sin señal') + ')'; p.mal = !navigator.onLine ? false : true; pintar(); })
+  .then(function(){ S.subiendo = false; if (S.cola.length && S.cola[0] !== p) subir(); });
+}
+function recuperar(){
+  dbHacer('readonly', function(st){ return st.getAll(); }).then(function(todas){
+    if (!todas || !todas.length) return;
+    todas.forEach(function(x){ if (S.cola.some(function(c){ return c.k === x.k; })) return; x.estado = 'en cola'; S.cola.push(x); S.lista.push(x); });
+    aviso(todas.length + ' pista(s) guardadas en este equipo: se suben ahora.'); pintar(); subir();
+  });
+}
+
+/* ---------- Pantalla ---------- */
+function pintar(){
+  var b = $('boton');
+  b.disabled = !S.info;
+  b.textContent = S.activa ? '■ Detener y subir' : '● Grabar';
+  b.className = 'btn' + (S.activa ? ' rojo' : '');
+  var ul = $('pistas');
+  if (!S.lista.length) ul.innerHTML = '<li><span>Todavía no hay pistas.</span></li>';
+  else ul.innerHTML = S.lista.map(function(p){
+    return '<li><span>' + esc(p.nombre) + '</span><span class="est' + (p.ok ? ' ok' : p.mal ? ' mal' : '') + '">' + esc(p.estado) + '</span></li>';
+  }).join('');
+}
+function esc(t){ return String(t == null ? '' : t).replace(/[&<>"']/g, function(c){ return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]; }); }
+function tick(){
+  var r = $('reloj'), sub = $('relojSub');
+  if (S.activa && S.pista) {
+    var s = Math.floor((Date.now() - S.pista.inicio) / 1000);
+    r.firstChild.nodeValue = Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2);
+    r.className = 'reloj rec';
+    sub.textContent = '● grabando · de ' + MIN + ':00 · franja ' + S.pista.franja;
+    if (s >= MIN * 60) cortar();
+  } else { r.firstChild.nodeValue = '0:00'; r.className = 'reloj'; sub.textContent = 'Cada pista dura ' + MIN + ' minutos y se sube sola'; }
+  if (S.cola.length && !S.subiendo && navigator.onLine && (Date.now() % 30000) < 1000) subir();
+}
+
+$('boton').onclick = function(){ if (S.activa) detener(); else iniciar(); };
+$('franja').onchange = function(){
+  if (!S.activa || !S.pista) return;
+  if (Date.now() - S.pista.inicio < 60000) { S.pista.franja = this.value; return; }
+  cortar();
+};
+document.addEventListener('visibilitychange', function(){
+  if (document.hidden) return;
+  pedirPantalla();
+  if (S.activa && S.rec && S.rec.state !== 'recording') { S.activa = false; aviso('La grabación se detuvo cuando salió de esta pestaña. Pulse Grabar de nuevo.', true); pintar(); }
+});
+window.addEventListener('online', subir);
+window.addEventListener('beforeunload', function(e){ if (S.activa || S.cola.length) { e.preventDefault(); e.returnValue = 'Hay una grabación sin subir.'; return e.returnValue; } });
+
+leerParametros();
+setInterval(tick, 1000);
+if (!S.exec || !S.token) {
+  $('subtitulo').textContent = 'Abra esta grabadora desde la aplicación del taller (tarjeta «Grabación de audio»).';
+  recuperar();
+} else {
+  llamar('infoGrabadora', [S.token]).then(function(i){
+    S.info = i;
+    $('titulo').textContent = 'Grabadora · ' + i.app;
+    $('subtitulo').textContent = i.sesion + ' · ' + i.relator + (i.rol === 'mesa' ? ' · mesa ' + i.mesa : '');
+    $('franja').innerHTML = i.franjas.map(function(f){ return '<option value="' + esc(f.id) + '">Franja ' + esc(f.nombre) + '</option>'; }).join('');
+    if (S.franjaInicial) $('franja').value = S.franjaInicial;
+    pintar(); recuperar();
+  }).catch(function(e){
+    if (!S.vencido) aviso('No pude conectar con la aplicación (' + e.message + '). Revise la señal y recargue la página.', true);
+    recuperar();
+  });
+}
+pintar();
+</script>
+</body>
+</html>
